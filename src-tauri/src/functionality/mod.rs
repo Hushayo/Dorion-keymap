@@ -9,6 +9,10 @@ pub mod hotkeys;
 
 pub mod keyboard;
 
+#[cfg(feature = "hotkeys")]
+#[cfg(target_os = "windows")]
+pub mod powertoys;
+
 #[cfg(target_os = "macos")]
 pub mod menu;
 

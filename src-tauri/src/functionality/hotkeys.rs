@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 use std::{
   collections::HashMap,
   sync::{
-    Arc, Mutex,
+    Arc, LazyLock, Mutex,
     atomic::{AtomicBool, Ordering},
   },
+  time::{Duration, Instant},
 };
 use tauri::{Emitter, Listener};
 
@@ -18,9 +19,13 @@ use crate::{
 };
 
 use super::keyboard::{KeyStruct, KeybindChangedEvent};
+#[cfg(target_os = "windows")]
+use super::powertoys;
 
 pub static KEYBINDS_CHANGED: AtomicBool = AtomicBool::new(false);
 pub static PTT_ENABLED: AtomicBool = AtomicBool::new(false);
+static RECENT_ACTIONS: LazyLock<Mutex<HashMap<String, (Instant, Option<bool>)>>> =
+  LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[tauri::command]
 pub fn get_keybinds() -> HashMap<String, Vec<KeyStruct>> {
@@ -56,16 +61,32 @@ pub fn trigger_keys_pressed(
   let keybinds = get_keybinds();
 
   // Convert the input keys to a hotkey for comparison
-  let input_hotkey = match keystructs_to_hotkey(&keys) {
+  let mut input_hotkey = match keystructs_to_hotkey(&keys) {
     Some(hotkey) => hotkey,
     None => {
       return;
     }
   };
 
+  #[cfg(target_os = "windows")]
+  let keymap = powertoys::get();
+
+  // PowerToys remaps keys before Dorion sees them, but the webview still
+  // receives the physical key. Translate it so focused keybinds match too.
+  #[cfg(target_os = "windows")]
+  if let Some(translated) = keymap.translate(&input_hotkey) {
+    input_hotkey = translated;
+  }
+
   // Find matching action(s) for these keys
   for (action, action_keys) in &keybinds {
     if let Some(action_hotkey) = keystructs_to_hotkey(action_keys) {
+      // A keybind using a remapped source key no longer exists in the keymap.
+      #[cfg(target_os = "windows")]
+      if keymap.is_source(&action_hotkey) {
+        continue;
+      }
+
       if hotkeys_match(&input_hotkey, &action_hotkey) {
         log!("Key combination matched action: {}", action);
 
@@ -98,8 +119,10 @@ pub fn start_keybind_watcher(win: &tauri::WebviewWindow<crate::Runtime>) {
       return;
     }
   };
-  let hook = Mutex::new(hook);
+  let hook = Arc::new(Mutex::new(hook));
 
+  let keybind_hook = hook.clone();
+  let keybind_win = win_hook.clone();
   win.listen("keybinds_changed", move |evt| {
     let payload = evt.payload();
     if payload.is_empty() {
@@ -116,7 +139,7 @@ pub fn start_keybind_watcher(win: &tauri::WebviewWindow<crate::Runtime>) {
     set_keybinds(keybinds_map);
 
     // Drop and recreate the hook to apply new keybinds
-    *hook.lock().unwrap() = match new_hook(win_hook.clone()) {
+    *keybind_hook.lock().unwrap() = match new_hook(keybind_win.clone()) {
       Ok(new_hook) => new_hook,
       Err(e) => {
         log!("Failed to recreate keybind hook: {}", e);
@@ -126,6 +149,45 @@ pub fn start_keybind_watcher(win: &tauri::WebviewWindow<crate::Runtime>) {
 
     KEYBINDS_CHANGED.store(true, std::sync::atomic::Ordering::Relaxed);
   });
+
+  // PowerToys can change its remaps while Dorion is running. Re-read its
+  // config and rebuild the hook so keybinds immediately follow the new keymap.
+  #[cfg(target_os = "windows")]
+  {
+    let watch_win = win.clone();
+    std::thread::spawn(move || {
+      let mut last_mtime = powertoys::config_mtime();
+
+      loop {
+        std::thread::sleep(Duration::from_secs(5));
+
+        let mtime = powertoys::config_mtime();
+        if mtime == last_mtime {
+          continue;
+        }
+
+        last_mtime = mtime;
+
+        powertoys::reload();
+        let _ = watch_win.emit("powertoys_keymap_changed", ());
+      }
+    });
+
+    let keymap_hook = hook.clone();
+    let keymap_win = win_hook.clone();
+    win.listen("powertoys_keymap_changed", move |_| {
+      *keymap_hook.lock().unwrap() = match new_hook(keymap_win.clone()) {
+        Ok(new_hook) => new_hook,
+        Err(e) => {
+          log!(
+            "Failed to recreate keybind hook after PowerToys keymap change: {}",
+            e
+          );
+          return;
+        }
+      };
+    });
+  }
 
   win.listen("ptt_toggled", |evt| {
     #[derive(Serialize, Deserialize)]
@@ -176,6 +238,9 @@ fn register_all_keybinds(
   hook: &Arc<Hook>,
   keybinds: &HashMap<String, Vec<KeyStruct>>,
 ) {
+  #[cfg(target_os = "windows")]
+  let keymap = powertoys::reload();
+
   for (action, keys) in keybinds {
     let win = win.clone();
     let hotkey = match keystructs_to_hotkey(keys) {
@@ -185,6 +250,18 @@ fn register_all_keybinds(
         continue;
       }
     };
+
+    // PowerToys replaces this key with a different one, so the old keybind no
+    // longer exists. The remapped target is matched by the injected key event.
+    #[cfg(target_os = "windows")]
+    if keymap.is_source(&hotkey) {
+      log!(
+        "Skipping keybind for action {} because PowerToys remaps {}",
+        action,
+        hotkey
+      );
+      continue;
+    }
 
     let action_clone = action.clone();
 
@@ -218,8 +295,32 @@ fn register_all_keybinds(
   }
 }
 
+/// Both the global hook and the focused-window webview listener can see the
+/// same key press. Drop the duplicate so toggle actions don't fire twice.
+fn should_emit(action: &str, pressed: Option<bool>) -> bool {
+  const DEDUPE_WINDOW: Duration = Duration::from_millis(150);
+
+  let now = Instant::now();
+  let mut recent = RECENT_ACTIONS.lock().unwrap();
+
+  if let Some((last, last_pressed)) = recent.get(action)
+    && now.duration_since(*last) < DEDUPE_WINDOW
+    && (pressed.is_none() || *last_pressed == pressed)
+  {
+    return false;
+  }
+
+  recent.insert(action.to_string(), (now, pressed));
+
+  true
+}
+
 fn handle_push_action(win: &tauri::WebviewWindow<crate::Runtime>, action: &str, pressed: bool) {
   if !PTT_ENABLED.load(Ordering::Relaxed) && action == "PUSH_TO_TALK" {
+    return;
+  }
+
+  if !should_emit(action, Some(pressed)) {
     return;
   }
 
@@ -235,6 +336,10 @@ fn handle_push_action(win: &tauri::WebviewWindow<crate::Runtime>, action: &str, 
 }
 
 fn handle_regular_action(win: &tauri::WebviewWindow<crate::Runtime>, action: &str) {
+  if !should_emit(action, None) {
+    return;
+  }
+
   log!("Regular action triggered: {}", action);
 
   win
